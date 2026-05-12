@@ -1,0 +1,34 @@
+{
+  "name": "ai-assistant",
+  "description": "AI-Assistant Chrome Extension",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "zip:firefox": "wxt zip -b firefox",
+    "compile": "tsc --noEmit",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.2",
+    "marked": "^18.0.3",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "turndown": "^7.2.4"
+  },
+  "devDependencies": {
+    "@types/dom-chromium-ai": "^0.0.16",
+    "@types/dompurify": "^3.2.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/turndown": "^5.0.6",
+    "@wxt-dev/module-react": "^1.1.5",
+    "typescript": "^5.9.3",
+    "wxt": "^0.20.26"
+  }
+}

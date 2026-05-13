@@ -41,6 +41,19 @@ const strings: Record<string, Record<Lang, string>> = {
   chars: { en: 'chars', es: 'caracteres' },
   image: { en: 'image', es: 'imagen' },
   summarizing: { en: 'summarizing...', es: 'resumiendo...' },
+  boot_title: { en: 'Terminal AI System v1.0.0', es: 'Sistema de IA en terminal v1.0.0' },
+  boot_checking: { en: 'Checking model availability...', es: 'Verificando disponibilidad del modelo...' },
+  boot_unavailable: { en: 'Model not available', es: 'Modelo no disponible' },
+  boot_downloading: { en: 'Downloading model...', es: 'Modelo descargándose...' },
+  boot_fetch_page: { en: 'Fetching page content...', es: 'Obteniendo contenido de la página...' },
+  boot_init_session: { en: 'Initializing AI session...', es: 'Inicializando sesión de IA...' },
+  boot_page_large: { en: 'Page too large, summarizing...', es: 'Página grande, resumiendo contenido...' },
+  boot_cached: { en: 'Using cached page summary', es: 'Usando resumen de página guardado' },
+  boot_summary_done: { en: 'Summary completed', es: 'Resumen completado' },
+  boot_retry_no_page: { en: 'Retrying without page content...', es: 'Reintentando sin contenido de página...' },
+  boot_creating: { en: 'Creating session with summary...', es: 'Creando sesión con resumen...' },
+  boot_ready: { en: 'System ready.', es: 'Sistema listo.' },
+  boot_error: { en: 'Error:', es: 'Error:' },
 };
 
 export function t(key: string, lang: Lang): string {

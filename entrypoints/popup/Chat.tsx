@@ -108,6 +108,19 @@ interface Props {
 }
 
 export default function Chat({ lang, onLangChange }: Props) {
+  function BootPrompt() {
+    return (
+      <>
+        <span className="prompt-user">system</span>
+        <span className="prompt-dim">@</span>
+        <span className="prompt-host">boot</span>
+        <span className="prompt-dim">:</span>
+        <span className="prompt-path">~</span>
+        <span className="prompt-char">$</span>
+      </>
+    );
+  }
+
   const [messages, setMessages] = useState<StoredMessage[]>([]);
   const [input, setInput] = useState('');
   const [grabbedInfo, setGrabbedInfo] = useState<{ text: string; isImage: boolean } | null>(null);
@@ -120,11 +133,14 @@ export default function Chat({ lang, onLangChange }: Props) {
   const [isAnimCtx, setIsAnimCtx] = useState(false);
   const displayCtxRef = useRef('');
   const [overflowMsg, setOverflowMsg] = useState(false);
+  const [bootDisplay, setBootDisplay] = useState<{ msg: string; ts: string }[]>([]);
+  const [bootCurrent, setBootCurrent] = useState('');
   const overflowRef = useRef(false);
   const rebuildingRef = useRef(false);
   const summarizingRef = useRef(false);
   const sessionRef = useRef<AILanguageModel | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const bootLogRef = useRef<HTMLDivElement>(null);
   const pageContextRef = useRef<string | null>(null);
   const currentUrlRef = useRef<string>('');
   const pendingImageRef = useRef<Blob | null>(null);
@@ -150,6 +166,84 @@ export default function Chat({ lang, onLangChange }: Props) {
       setContextUsage({ used, total });
     }
   }
+
+  const BOOT_LINES: Record<Lang, string[]> = {
+    en: [
+      'Mounting kernel modules...',
+      'Initializing Gemini Nano runtime...',
+      'Loading language model weights...',
+      'Calibrating context window...',
+      'Establishing content script bridge...',
+      'Configuring session parameters...',
+      'Starting Prompt API service...',
+      'Optimizing token pipeline...',
+      'Syncing page context...',
+      'Ready.',
+    ],
+    es: [
+      'Montando módulos del kernel...',
+      'Inicializando runtime de Gemini Nano...',
+      'Cargando pesos del modelo lingüístico...',
+      'Calibrando ventana de contexto...',
+      'Estableciendo puente con content script...',
+      'Configurando parámetros de sesión...',
+      'Iniciando servicio Prompt API...',
+      'Optimizando pipeline de tokens...',
+      'Sincronizando contexto de página...',
+      'Listo.',
+    ],
+  };
+
+  const bootAnimState = useRef({ lineIdx: 0, charIdx: 0, displayed: false, bootDone: false });
+  const bootDoneRef = useRef(false);
+
+  function ts() {
+    const d = new Date();
+    return `[${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}]`;
+  }
+
+  useEffect(() => {
+    if (status !== 'init') return;
+    const lines = BOOT_LINES[lang];
+    const state = bootAnimState.current;
+    state.lineIdx = 0;
+    state.charIdx = 0;
+    state.displayed = false;
+    state.bootDone = false;
+    bootDoneRef.current = false;
+    setBootDisplay([]);
+    setBootCurrent('');
+
+    const t = setInterval(() => {
+      const line = lines[state.lineIdx];
+
+      if (state.displayed) {
+        state.lineIdx = (state.lineIdx + 1) % lines.length;
+        state.charIdx = 0;
+        state.displayed = false;
+      }
+
+      if (state.charIdx < line.length) {
+        state.charIdx++;
+        setBootCurrent(line.slice(0, state.charIdx));
+      } else {
+        const timeStr = ts();
+        setBootDisplay((prev) => {
+          const next = [...prev, { msg: line, ts: timeStr }];
+          return next.length > 15 ? next.slice(-15) : next;
+        });
+        state.displayed = true;
+      }
+    }, 35);
+
+    return () => clearInterval(t);
+  }, [status, lang]);
+
+  useLayoutEffect(() => {
+    if (bootLogRef.current) {
+      bootLogRef.current.scrollTop = bootLogRef.current.scrollHeight;
+    }
+  }, [bootDisplay, bootCurrent]);
 
   async function appendPageContext(url: string) {
     if (!sessionRef.current || !pageContextRef.current) return;
@@ -357,7 +451,6 @@ export default function Chat({ lang, onLangChange }: Props) {
 
     async function boot() {
       browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['boot: start', { lang }] }).catch(() => {});
-      setStatus('init');
       setError('');
       try {
         const avail = await checkAvailability({ language: lang });
@@ -407,11 +500,9 @@ export default function Chat({ lang, onLangChange }: Props) {
         } catch (e: any) {
           if (pageContent && (e?.message?.includes('too large') || e?.name === 'QuotaExceededError')) {
             let summarized = '';
-            // Check cache first
             const cached = await browser.storage.local.get(PAGE_CACHE_KEY).then(r => r[PAGE_CACHE_KEY] as { url: string; text: string } | undefined);
             if (cached?.url === pageUrl) {
               summarized = cached.text;
-              browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['boot: cached page summary', { url: pageUrl, len: summarized.length }] }).catch(() => {});
             } else {
               const SummarizerAPI = (self as any).Summarizer;
               if (SummarizerAPI) {
@@ -431,9 +522,7 @@ export default function Chat({ lang, onLangChange }: Props) {
                   language: lang,
                   history: [...history, { role: 'user' as const, content: summarized }],
                 });
-              } catch {
-                // Summarized page also too large — try without page
-              }
+              } catch {}
             }
             if (!session) {
               session = await createSession({
@@ -442,8 +531,6 @@ export default function Chat({ lang, onLangChange }: Props) {
                 history,
               });
               pageContent = '';
-            } else {
-              pageContent = summarized;
             }
           } else {
             throw e;
@@ -464,10 +551,11 @@ export default function Chat({ lang, onLangChange }: Props) {
           browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['event: contextoverflow', { usage: sessionRef.current?.contextUsage }] }).catch(() => {});
         });
         updateContextUsage('boot');
+        bootDoneRef.current = true;
         setStatus('ready');
       } catch (e: any) {
         setStatus('error');
-        setError(e?.message ?? t('init_failed', lang));
+        setError((e as any)?.message ?? t('init_failed', lang));
       }
     }
 
@@ -727,9 +815,38 @@ export default function Chat({ lang, onLangChange }: Props) {
   if (status === 'init') {
     return (
       <div className="chat">
-        <div className="chat-status chat-status-loading">
-          <span className="chat-status-prefix">$</span>
-          <span className="chat-status-text">{t('init_ai', lang)}</span>
+        <div className="chat-boot-log" ref={bootLogRef}>
+
+          <div className="chat-msg chat-msg--user" style={{ marginBottom: 4 }}>
+            <div className="chat-msg-prompt">
+              <BootPrompt />
+            </div>
+            <div className="chat-boot-text">{t('boot_title', lang)}</div>
+          </div>
+
+          {bootDisplay.map((item, i) => (
+            <div key={i} className="chat-msg chat-msg--user" style={{ marginBottom: 4 }}>
+              <div className="chat-msg-prompt">
+                <BootPrompt />
+                <span className="chat-ts">{item.ts}</span>
+              </div>
+              <div className="chat-boot-text">{item.msg}</div>
+            </div>
+          ))}
+          {bootCurrent && (
+            <div className="chat-msg chat-msg--user" style={{ marginBottom: 0 }}>
+              <div className="chat-msg-prompt">
+                <BootPrompt />
+              </div>
+              <div className="chat-boot-text">{bootCurrent}<span className="boot-cursor">█</span></div>
+            </div>
+          )}
+        </div>
+        <div className="boot-loader">
+          <span className="boot-loader-prompt">&gt;</span>
+          <span className="boot-loader-text">
+            <span className="boot-loader-dot">.</span><span className="boot-loader-dot">.</span><span className="boot-loader-dot">.</span>
+          </span>
         </div>
       </div>
     );
@@ -738,6 +855,28 @@ export default function Chat({ lang, onLangChange }: Props) {
   if (status === 'error') {
     return (
       <div className="chat">
+        <div className="chat-boot-log" ref={bootLogRef}>
+          {bootDisplay.map((item, i) => (
+            <div key={i} className="chat-msg chat-msg--user" style={{ marginBottom: 4 }}>
+              <div className="chat-msg-prompt">
+                <BootPrompt />
+                <span className="chat-ts">{item.ts}</span>
+              </div>
+              <div className="chat-boot-text" style={{ color: 'var(--accent-red)' }}>{item.msg}</div>
+            </div>
+          ))}
+          <div className="chat-msg chat-msg--user" style={{ marginBottom: 0 }}>
+            <div className="chat-msg-prompt">
+              <span className="prompt-user" style={{ color: 'var(--accent-red)' }}>!</span>
+              <span className="prompt-dim">@</span>
+              <span className="prompt-host">error</span>
+              <span className="prompt-dim">:</span>
+              <span className="prompt-path">~</span>
+              <span className="prompt-char">$</span>
+            </div>
+            <div className="chat-boot-text" style={{ color: 'var(--accent-red)' }}>{error}</div>
+          </div>
+        </div>
         <div className="chat-lang-bar">
           <span className="chat-lang-label">{t('output', lang)}:</span>
           {(['en', 'es'] as Lang[]).map((l) => (
@@ -745,10 +884,6 @@ export default function Chat({ lang, onLangChange }: Props) {
               {LANG_LABELS[l]}
             </button>
           ))}
-        </div>
-        <div className="chat-status chat-error">
-          <span className="chat-status-prefix">!</span>
-          <span className="chat-status-text">{error}</span>
         </div>
       </div>
     );

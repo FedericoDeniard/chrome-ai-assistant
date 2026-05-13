@@ -318,6 +318,12 @@ body {
   margin-left: auto;
 }
 
+.boot-cursor {
+  animation: blink 0.6s step-end infinite;
+  color: var(--accent-green);
+  margin-left: 4px;
+}
+
 /* Content block (assistant) */
 .chat-msg-block {
   font-size: 13px;
@@ -638,6 +644,82 @@ body {
   border-color: var(--accent-red);
 }
 
+/* ── Boot terminal ── */
+.chat-boot-log {
+  flex: 1;
+  overflow-y: auto;
+  scrollbar-width: none;
+  padding: 8px 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.chat-boot-log::-webkit-scrollbar { display: none; }
+
+.chat-boot-msg {
+  color: var(--fg-primary);
+  flex: 1;
+}
+
+.chat-boot-title {
+  color: var(--fg-muted);
+}
+
+.chat-boot-text {
+  color: var(--fg-primary);
+  font-size: 13px;
+  line-height: 1.6;
+  padding-left: 20px;
+}
+
+.chat-boot-text::before {
+  content: '❯ ';
+  color: var(--accent-cyan);
+}
+
+/* ── Boot loader ── */
+.boot-loader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.boot-loader-prompt {
+  color: var(--accent-cyan);
+  font-weight: 700;
+  user-select: none;
+}
+
+.boot-loader-text {
+  color: var(--fg-dim);
+  display: flex;
+  gap: 2px;
+}
+
+.boot-loader-dot {
+  animation: boot-load 1.4s ease-in-out infinite;
+}
+
+.boot-loader-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.boot-loader-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes boot-load {
+  0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-2px); }
+}
+
 /* ── Status / Error ── */
 .chat-status {
   display: flex;
@@ -695,4 +777,6 @@ body {
   .chat-overflow { animation: none; opacity: 1; }
   .chat-grabbed-text--summarizing { animation: none; opacity: 0.6; }
   .ctx-cursor { animation: none; display: none; }
+  .boot-cursor { animation: none; display: none; }
+  .boot-loader-dot { animation: none; opacity: 0.4; }
 }

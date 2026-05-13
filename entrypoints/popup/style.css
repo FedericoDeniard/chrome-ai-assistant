@@ -548,6 +548,11 @@ body {
   color: var(--fg-muted);
 }
 
+.ctx-cursor {
+  animation: blink 0.6s step-end infinite;
+  color: var(--accent-green);
+}
+
 .chat-send {
   height: 34px;
   padding: 0 14px;
@@ -689,4 +694,5 @@ body {
   .chat-status-loading::after { animation: none; }
   .chat-overflow { animation: none; opacity: 1; }
   .chat-grabbed-text--summarizing { animation: none; opacity: 0.6; }
+  .ctx-cursor { animation: none; display: none; }
 }

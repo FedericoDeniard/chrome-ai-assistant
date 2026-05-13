@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { checkAvailability, createSession } from '@/lib/ai';
 import type { AILanguageModel, Message } from '@/lib/ai';
 import { marked } from 'marked';
@@ -43,7 +43,7 @@ const SYSTEM_PROMPTS: Record<Lang, string> = {
 
 const STORAGE_KEY = 'chat_state';
 const GRAB_KEY = 'grabbed_content';
-const SUMMARY_CACHE_KEY = 'page_summary_cache';
+const PAGE_CACHE_KEY = 'page_summary_v2';
 
 interface StoredState {
   messages: StoredMessage[];
@@ -116,6 +116,9 @@ export default function Chat({ lang, onLangChange }: Props) {
   const [status, setStatus] = useState<'init' | 'ready' | 'error'>('init');
   const [error, setError] = useState('');
   const [contextUsage, setContextUsage] = useState<{ used: number; total: number } | null>(null);
+  const [displayCtx, setDisplayCtx] = useState('');
+  const [isAnimCtx, setIsAnimCtx] = useState(false);
+  const displayCtxRef = useRef('');
   const [overflowMsg, setOverflowMsg] = useState(false);
   const overflowRef = useRef(false);
   const rebuildingRef = useRef(false);
@@ -171,60 +174,134 @@ export default function Chat({ lang, onLangChange }: Props) {
     }
   }
 
-  async function recursiveSummarize(text: string, SummarizerAPI: any, outLang: Lang): Promise<string> {
-    const CHUNK_SIZE = 5000;
-    const summarizer = await SummarizerAPI.create({ type: 'key-points', format: 'plain-text', length: 'long', outputLanguage: outLang });
+  const SUMMARY_LEVELS = [
+    { type: 'key-points' as const, length: 'long' as const, chunk: 5000 },
+    { type: 'teaser' as const, length: 'long' as const, chunk: 4000 },
+    { type: 'tldr' as const, length: 'long' as const, chunk: 3000 },
+    { type: 'headline' as const, length: 'long' as const, chunk: 2000 },
+    { type: 'tldr' as const, length: 'short' as const, chunk: 1000 },
+  ];
+
+  async function recursiveSummarize(text: string, SummarizerAPI: any, outLang: Lang, level = 0, ctx?: string): Promise<string> {
+    const cfg = SUMMARY_LEVELS[level] ?? SUMMARY_LEVELS[SUMMARY_LEVELS.length - 1];
+    const summarizer = await SummarizerAPI.create({ type: cfg.type, format: 'plain-text', length: cfg.length, outputLanguage: outLang });
     const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += CHUNK_SIZE) {
-      chunks.push(text.slice(i, i + CHUNK_SIZE));
+    for (let i = 0; i < text.length; i += cfg.chunk) {
+      chunks.push(text.slice(i, i + cfg.chunk));
     }
     const summaries: string[] = [];
     for (const chunk of chunks) {
-      summaries.push(await summarizer.summarize(chunk));
+      summaries.push(await summarizer.summarize(chunk, ctx ? { context: ctx } : undefined));
     }
     const combined = summaries.join('\n');
-    if (combined.length > CHUNK_SIZE) {
-      return recursiveSummarize(combined, SummarizerAPI, outLang);
+    if (combined.length > cfg.chunk) {
+      return recursiveSummarize(combined, SummarizerAPI, outLang, level, ctx);
     }
     return combined;
   }
 
+  async function trySummarize(text: string, SummarizerAPI: any, outLang: Lang, ctx?: string): Promise<string | null> {
+    for (let level = 0; level < SUMMARY_LEVELS.length; level++) {
+      try {
+        const cfg = SUMMARY_LEVELS[level];
+        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['summarize: try level', { level, type: cfg.type, length: cfg.length }] }).catch(() => {});
+        const result = await recursiveSummarize(text, SummarizerAPI, outLang, level, ctx);
+        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['summarize: ok', { level, len: result.length }] }).catch(() => {});
+        return result;
+      } catch (e) {
+        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['summarize: level failed', { level, msg: String(e) }] }).catch(() => {});
+      }
+    }
+    return null;
+  }
+
   async function rebuildSession(overrideMessages?: StoredMessage[], acceptImages?: boolean) {
+    browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: start', { rebuilding: rebuildingRef.current }] }).catch(() => {});
     if (rebuildingRef.current) return;
     rebuildingRef.current = true;
     setOverflowMsg(true);
     try {
       const SummarizerAPI = (self as any).Summarizer;
-      if (!SummarizerAPI) return;
-
-      const avail = await SummarizerAPI.availability();
-      if (avail === 'unavailable' || avail === 'downloading') return;
-
-      const messages = overrideMessages ?? messagesRef.current;
-      if (messages.length < 2) return;
-
-      const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n\n');
-      const summarizer = await SummarizerAPI.create({ type: 'key-points', format: 'plain-text', length: 'short', outputLanguage: lang });
-      const summary = await summarizer.summarize(conversationText);
-
-      if (!summary || !sessionRef.current) return;
-
-      const pageContent = pageContextRef.current;
-      const lastTwo = messages.slice(-2).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
-      const newPrompts: { role: 'user' | 'assistant'; content: string }[] = [
-        { role: 'user' as const, content: `[Previous conversation summary: ${summary}]` },
-        ...lastTwo,
-      ];
-      if (pageContent) {
-        newPrompts.push({ role: 'user' as const, content: pageContent });
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: SummarizerAPI', { available: !!SummarizerAPI }] }).catch(() => {});
+      if (!SummarizerAPI) {
+        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: skip - no Summarizer API'] }).catch(() => {});
+        return;
       }
 
-      const newSession = await createSession({
-        systemPrompt: SYSTEM_PROMPTS[lang],
-        language: lang,
-        history: newPrompts,
-        acceptImages,
-      });
+      const avail = await SummarizerAPI.availability();
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: availability', { avail }] }).catch(() => {});
+      if (avail === 'unavailable' || avail === 'downloading') {
+        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: skip - not ready', { avail }] }).catch(() => {});
+        return;
+      }
+
+      const messages = overrideMessages ?? messagesRef.current;
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: messages', { count: messages.length }] }).catch(() => {});
+      if (messages.length < 2) {
+        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: skip - too few messages'] }).catch(() => {});
+        return;
+      }
+
+      const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n\n');
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: summarizing', { len: conversationText.length }] }).catch(() => {});
+      const summary = await trySummarize(conversationText, SummarizerAPI, lang);
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: summary result', { ok: !!summary }] }).catch(() => {});
+
+      // Try creating a rebuilt session with summary + last messages + page
+      let newSession: AILanguageModel | null = null;
+
+      if (summary && sessionRef.current) {
+        const pageContent = pageContextRef.current || await (async () => {
+          const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+          if (!tab?.id) return null;
+          try {
+            const md = await browser.tabs.sendMessage(tab.id, { type: 'GET_PAGE_CONTEXT' }) as string;
+            if (md) {
+              pageContextRef.current = md;
+              const m = md.match(/^URL: (.+)$/m);
+              if (m) currentUrlRef.current = m[1];
+              return md;
+            }
+          } catch {}
+          return null;
+        })();
+        const lastTwo = messages.slice(-2).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+        const newPrompts: { role: 'user' | 'assistant'; content: string }[] = [
+          { role: 'user' as const, content: `[Previous conversation summary: ${summary}]` },
+          ...lastTwo,
+        ];
+        if (pageContent) {
+          newPrompts.push({ role: 'user' as const, content: pageContent });
+        }
+
+        try {
+          newSession = await createSession({
+            systemPrompt: SYSTEM_PROMPTS[lang],
+            language: lang,
+            history: newPrompts,
+            acceptImages,
+          });
+        } catch {}
+      }
+
+      // If the summarized rebuild failed, try minimal: just last user message, no page
+      if (!newSession) {
+        const lastMsg = messages.slice(-1).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+        try {
+          newSession = await createSession({
+            systemPrompt: SYSTEM_PROMPTS[lang],
+            language: lang,
+            history: lastMsg,
+            acceptImages,
+          });
+          browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: minimal session created'] }).catch(() => {});
+        } catch (e) {
+          browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: minimal also failed', { msg: String(e) }] }).catch(() => {});
+          return;
+        }
+      }
+
+      if (!newSession) return;
 
       sessionRef.current?.destroy();
       sessionRef.current = newSession;
@@ -233,7 +310,7 @@ export default function Chat({ lang, onLangChange }: Props) {
         pageAppendedRef.current = true;
       }
       updateContextUsage('rebuild');
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['session: rebuilt', { summary: summary.slice(0, 200) }] }).catch(() => {});
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['session: rebuilt'] }).catch(() => {});
     } catch (e) {
       browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: error', { msg: String(e) }] }).catch(() => {});
     } finally {
@@ -297,7 +374,7 @@ export default function Chat({ lang, onLangChange }: Props) {
           return;
         }
 
-        // Fetch current page context BEFORE creating session
+        // Fetch current page context and create session
         let pageContent = '';
         let pageUrl = '';
         const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -316,62 +393,66 @@ export default function Chat({ lang, onLangChange }: Props) {
           } catch {}
         }
 
-        // Try page in session, summarize if too large
+        // Create session with history and full page context
         const history = bootHistoryRef.current.map(m => ({ role: m.role, content: m.content }));
-        let pageIncluded = false;
         let session;
-        const cache = await browser.storage.local.get(SUMMARY_CACHE_KEY).then(r => r[SUMMARY_CACHE_KEY] as { url: string; summary: string } | undefined);
-
-        if (pageContent) {
-          try {
-            session = await createSession({
-              systemPrompt: SYSTEM_PROMPTS[lang],
-              language: lang,
-              history: [...history, { role: 'user' as const, content: pageContent }],
-            });
-            pageIncluded = true;
-            appendedUrlRef.current = pageUrl!;
-            pageAppendedRef.current = true;
-          } catch (e: any) {
-            if (e?.message?.includes('too large') || e?.name === 'QuotaExceededError') {
-              let pageForSession: string | undefined;
-              if (cache?.url === pageUrl) {
-                pageForSession = cache.summary;
-              } else {
-                const SummarizerAPI = (self as any).Summarizer;
-                if (SummarizerAPI) {
-                  const avail = await SummarizerAPI.availability();
-                  if (avail !== 'unavailable' && avail !== 'downloading') {
-                    pageForSession = await recursiveSummarize(pageContent, SummarizerAPI, lang);
-                    browser.storage.local.set({ [SUMMARY_CACHE_KEY]: { url: pageUrl!, summary: pageForSession } }).catch(() => {});
-                  }
-                }
-              }
-              if (pageForSession) {
-                session = await createSession({
-                  systemPrompt: SYSTEM_PROMPTS[lang],
-                  language: lang,
-                  history: [...history, { role: 'user' as const, content: pageForSession }],
-                });
-                pageIncluded = true;
-                appendedUrlRef.current = pageUrl!;
-                pageAppendedRef.current = true;
-              }
-            }
-          }
-        }
-
-        if (!session) {
+        try {
           session = await createSession({
             systemPrompt: SYSTEM_PROMPTS[lang],
             language: lang,
-            history,
+            history: pageContent
+              ? [...history, { role: 'user' as const, content: pageContent }]
+              : history,
           });
+        } catch (e: any) {
+          if (pageContent && (e?.message?.includes('too large') || e?.name === 'QuotaExceededError')) {
+            let summarized = '';
+            // Check cache first
+            const cached = await browser.storage.local.get(PAGE_CACHE_KEY).then(r => r[PAGE_CACHE_KEY] as { url: string; text: string } | undefined);
+            if (cached?.url === pageUrl) {
+              summarized = cached.text;
+              browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['boot: cached page summary', { url: pageUrl, len: summarized.length }] }).catch(() => {});
+            } else {
+              const SummarizerAPI = (self as any).Summarizer;
+              if (SummarizerAPI) {
+                const avail = await SummarizerAPI.availability();
+                if (avail !== 'unavailable' && avail !== 'downloading') {
+                  summarized = await trySummarize(pageContent, SummarizerAPI, lang, 'Be as precise and detailed as possible. Preserve all important information from the page.') ?? '';
+                  if (summarized) {
+                    browser.storage.local.set({ [PAGE_CACHE_KEY]: { url: pageUrl, text: summarized } }).catch(() => {});
+                  }
+                }
+              }
+            }
+            if (summarized) {
+              try {
+                session = await createSession({
+                  systemPrompt: SYSTEM_PROMPTS[lang],
+                  language: lang,
+                  history: [...history, { role: 'user' as const, content: summarized }],
+                });
+              } catch {
+                // Summarized page also too large — try without page
+              }
+            }
+            if (!session) {
+              session = await createSession({
+                systemPrompt: SYSTEM_PROMPTS[lang],
+                language: lang,
+                history,
+              });
+              pageContent = '';
+            } else {
+              pageContent = summarized;
+            }
+          } else {
+            throw e;
+          }
         }
 
         if (cancelled) { session.destroy(); return; }
         sessionRef.current = session;
-        if (pageUrl && pageIncluded) {
+        if (pageUrl && pageContent) {
           appendedUrlRef.current = pageUrl;
           pageAppendedRef.current = true;
         }
@@ -425,15 +506,56 @@ export default function Chat({ lang, onLangChange }: Props) {
     saveState(messages, lang, input);
   }, [messages, lang, input]);
 
-  useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages]);
+  useLayoutEffect(() => {
+    if (listRef.current) {
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+    }
+  }, [messages, status]);
 
   useEffect(() => {
     if (!overflowMsg) return;
     const id = setTimeout(() => setOverflowMsg(false), 2500);
     return () => clearTimeout(id);
   }, [overflowMsg]);
+
+  useEffect(() => {
+    if (!contextUsage) return;
+    const target = `${contextUsage.used}/${contextUsage.total} (${((contextUsage.used / contextUsage.total) * 100).toFixed(1)}%)`;
+    const from = displayCtxRef.current;
+
+    if (!from) {
+      displayCtxRef.current = target;
+      setDisplayCtx(target);
+      return;
+    }
+
+    if (from === target) return;
+
+    setIsAnimCtx(true);
+    const lenFrom = from.length;
+    const lenTo = target.length;
+    const totalSteps = lenFrom + lenTo;
+    let step = 0;
+
+    const t = setInterval(() => {
+      if (step < lenFrom) {
+        displayCtxRef.current = from.slice(0, lenFrom - step - 1);
+        setDisplayCtx(displayCtxRef.current);
+      } else {
+        displayCtxRef.current = target.slice(0, step - lenFrom + 1);
+        setDisplayCtx(displayCtxRef.current);
+      }
+      step++;
+      if (step >= totalSteps) {
+        displayCtxRef.current = target;
+        setDisplayCtx(target);
+        setIsAnimCtx(false);
+        clearInterval(t);
+      }
+    }, 45);
+
+    return () => { clearInterval(t); setIsAnimCtx(false); };
+  }, [contextUsage?.used]);
 
   async function send() {
     const text = inputRef.current.trim();
@@ -487,7 +609,7 @@ export default function Chat({ lang, onLangChange }: Props) {
             summarizingRef.current = true;
             setSummarizing(true);
             const sum = await SummarizerAPI.create({ type: 'key-points', format: 'plain-text', length: 'short', outputLanguage: lang });
-            grabText = await sum.summarize(grabbed.text);
+            grabText = await sum.summarize(grabbed.text, { context: text });
             setSummarizing(false);
             summarizingRef.current = false;
             browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['grab: summarized', { before: grabbed.text.length, after: grabText!.length }] }).catch(() => {});
@@ -516,76 +638,79 @@ export default function Chat({ lang, onLangChange }: Props) {
     setLoading(true);
 
     const maxAttempts = 2;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const aiTs = timestamp();
-      setMessages((prev) => [...prev, { role: 'assistant', content: '', ts: aiTs, url: currentUrl }]);
+    try {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const aiTs = timestamp();
+        setMessages((prev) => [...prev, { role: 'assistant', content: '', ts: aiTs, url: currentUrl }]);
 
-      try {
-        let session = sessionRef.current;
-        if (!session) throw new Error(t('no_session', lang));
+        try {
+          let session = sessionRef.current;
+          if (!session) throw new Error(t('no_session', lang));
 
-        if (imageBlob) {
-          const visionInput: any = [{ role: 'user' as const, content: [{ type: 'text' as const, value: text }, { type: 'image' as const, value: imageBlob }] }];
-          const response = await session.prompt(visionInput, { signal });
-          setMessages((prev) => {
-            const next = [...prev];
-            next[next.length - 1] = { ...next[next.length - 1], content: response, ts: aiTs };
-            return next;
-          });
-          updateContextUsage('image-prompt');
-        } else {
-          async function stream(s: AILanguageModel, prompt: string, sig: AbortSignal) {
-            let accumulated = '';
-            const stream = s.promptStreaming(prompt, { signal: sig });
-            for await (const chunk of stream) {
-              accumulated += chunk;
-              setMessages((prev) => {
-                const next = [...prev];
-                next[next.length - 1] = { ...next[next.length - 1], content: accumulated, ts: aiTs };
-                return next;
-              });
+          if (imageBlob) {
+            const visionInput: any = [{ role: 'user' as const, content: [{ type: 'text' as const, value: text }, { type: 'image' as const, value: imageBlob }] }];
+            const response = await session.prompt(visionInput, { signal });
+            setMessages((prev) => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], content: response, ts: aiTs };
+              return next;
+            });
+            updateContextUsage('image-prompt');
+          } else {
+            async function stream(s: AILanguageModel, prompt: string, sig: AbortSignal) {
+              let accumulated = '';
+              const stream = s.promptStreaming(prompt, { signal: sig });
+              for await (const chunk of stream) {
+                accumulated += chunk;
+                setMessages((prev) => {
+                  const next = [...prev];
+                  next[next.length - 1] = { ...next[next.length - 1], content: accumulated, ts: aiTs };
+                  return next;
+                });
+              }
             }
-          }
-          try {
-            await stream(session, textPrompt, signal);
-            updateContextUsage('stream-end');
-          } catch (e: any) {
-            const msg = e?.message ?? '';
-            if (msg.includes('output language')) {
-              session.destroy();
-              const retryHistory = messagesRef.current.map(m => ({ role: m.role, content: m.content }));
-              session = await createSession({ systemPrompt: SYSTEM_PROMPTS[lang], language: lang, history: retryHistory });
-              sessionRef.current = session;
-              appendedUrlRef.current = null;
-              pageAppendedRef.current = false;
-              if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
-              updateContextUsage('retry');
-              setMessages((prev) => [...prev.slice(0, -1), { role: 'assistant', content: '', ts: timestamp(), url: currentUrl }]);
+            try {
               await stream(session, textPrompt, signal);
-            } else {
-              throw e;
+              updateContextUsage('stream-end');
+            } catch (e: any) {
+              const msg = e?.message ?? '';
+              if (msg.includes('output language')) {
+                session.destroy();
+                const retryHistory = messagesRef.current.map(m => ({ role: m.role, content: m.content }));
+                session = await createSession({ systemPrompt: SYSTEM_PROMPTS[lang], language: lang, history: retryHistory });
+                sessionRef.current = session;
+                appendedUrlRef.current = null;
+                pageAppendedRef.current = false;
+                if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
+                updateContextUsage('retry');
+                setMessages((prev) => [...prev.slice(0, -1), { role: 'assistant', content: '', ts: timestamp(), url: currentUrl }]);
+                await stream(session, textPrompt, signal);
+              } else {
+                throw e;
+              }
             }
           }
+          break;
+        } catch (e: any) {
+          if (e?.name === 'AbortError') return;
+          if (attempt === 0 && (e?.name === 'QuotaExceededError' || e?.message?.includes('too large'))) {
+            const msgs = messagesRef.current.slice(0, -1);
+            setMessages(msgs);
+            overflowRef.current = true;
+            await rebuildSession(msgs, hasImageSession.current);
+            updateContextUsage('ctx-rebuild');
+            continue;
+          }
+          const friendly = `Error: ${e?.message ?? 'Unknown'}`;
+          setMessages((prev) => [...prev, { role: 'assistant', content: friendly, ts: timestamp(), url: currentUrl }]);
+          break;
         }
-        break;
-      } catch (e: any) {
-        if (e?.name === 'AbortError') return;
-        if (attempt === 0 && (e?.name === 'QuotaExceededError' || e?.message?.includes('too large'))) {
-          const msgs = messagesRef.current.slice(0, -1);
-          setMessages(msgs);
-          overflowRef.current = true;
-          await rebuildSession(msgs, hasImageSession.current);
-          continue;
-        }
-        const friendly = `Error: ${e?.message ?? 'Unknown'}`;
-        setMessages((prev) => [...prev, { role: 'assistant', content: friendly, ts: timestamp(), url: currentUrl }]);
-        break;
       }
+    } finally {
+      abortRef.current = null;
+      updateContextUsage('ctx-done');
+      setLoading(false);
     }
-
-    abortRef.current = null;
-    updateContextUsage('finally');
-    setLoading(false);
   }
 
   function stop() {
@@ -721,7 +846,9 @@ export default function Chat({ lang, onLangChange }: Props) {
       <div className="chat-model">
         <span>Gemini Nano <span className="chat-model-label">{t('model', lang).toLowerCase()}</span></span>
         <span className="chat-model-right">
-          {contextUsage && <span className="chat-model-ctx">{contextUsage.used}/{contextUsage.total}</span>}
+          {contextUsage && (
+            <span className="chat-model-ctx">{displayCtx}{isAnimCtx && <span className="ctx-cursor">█</span>}</span>
+          )}
           <span className="app-title-version">v1.0.0</span>
         </span>
       </div>

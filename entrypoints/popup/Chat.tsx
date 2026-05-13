@@ -37,12 +37,13 @@ interface StoredMessage {
 const LANG_LABELS: Record<Lang, string> = { en: 'EN', es: 'ES' };
 
 const SYSTEM_PROMPTS: Record<Lang, string> = {
-  en: 'You are a concise web assistant. You receive page context, then optional pasted text, then the user question. If pasted text is provided, prioritize it over the page context when answering. Be direct and brief.',
-  es: 'Sos un asistente web conciso. Recibís contexto de la página, luego texto opcional pegado, y luego la pregunta del usuario. Si hay texto pegado, priorizalo sobre el contexto de la página al responder. Sé directo y breve.',
+  en: 'You are a concise web assistant. Respond based on pasted text or your general knowledge. Be direct and brief.',
+  es: 'Sos un asistente web conciso. Respondé basado en texto pegado o tu conocimiento general. Sé directo y breve.',
 };
 
 const STORAGE_KEY = 'chat_state';
 const GRAB_KEY = 'grabbed_content';
+const SUMMARY_CACHE_KEY = 'page_summary_cache';
 
 interface StoredState {
   messages: StoredMessage[];
@@ -111,9 +112,14 @@ export default function Chat({ lang, onLangChange }: Props) {
   const [input, setInput] = useState('');
   const [grabbedInfo, setGrabbedInfo] = useState<{ text: string; isImage: boolean } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
   const [status, setStatus] = useState<'init' | 'ready' | 'error'>('init');
   const [error, setError] = useState('');
   const [contextUsage, setContextUsage] = useState<{ used: number; total: number } | null>(null);
+  const [overflowMsg, setOverflowMsg] = useState(false);
+  const overflowRef = useRef(false);
+  const rebuildingRef = useRef(false);
+  const summarizingRef = useRef(false);
   const sessionRef = useRef<AILanguageModel | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const pageContextRef = useRef<string | null>(null);
@@ -122,33 +128,134 @@ export default function Chat({ lang, onLangChange }: Props) {
   const hasImageSession = useRef(false);
   const inputRef = useRef(input);
   inputRef.current = input;
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const abortRef = useRef<AbortController | null>(null);
   const appendedUrlRef = useRef<string | null>(null);
   const pageAppendedRef = useRef(false);
+  const bootHistoryRef = useRef<StoredMessage[]>([]);
+  const bootedRef = useRef(false);
+  const bootLangRef = useRef<Lang | null>(null);
+  const [storageReady, setStorageReady] = useState(false);
 
-  function updateContextUsage() {
-    const s = sessionRef.current;
-    if (s) setContextUsage({ used: s.contextUsage, total: s.contextWindow });
+  function updateContextUsage(tag: string) {
+    const s: any = sessionRef.current;
+    if (s) {
+      const used = s.inputUsage ?? s.contextUsage ?? 0;
+      const total = s.inputQuota ?? s.contextWindow ?? 0;
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: [`${tag}: ${used}/${total}`, { inputUsage: s.inputUsage, inputQuota: s.inputQuota, contextUsage: s.contextUsage, contextWindow: s.contextWindow }] }).catch(() => {});
+      setContextUsage({ used, total });
+    }
   }
 
   async function appendPageContext(url: string) {
     if (!sessionRef.current || !pageContextRef.current) return;
     if (appendedUrlRef.current === url && pageAppendedRef.current) return;
     try {
-      await sessionRef.current.append([
-        { role: 'user', content: pageContextRef.current },
-      ]);
+      const s: any = sessionRef.current;
+      const content = pageContextRef.current;
+      const chunkSize = 2048;
+      const chunks = Math.ceil(content.length / chunkSize);
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['append: start', { totalLen: content.length, chunkSize, chunks, remaining: s.inputQuota - s.inputUsage, preview: content.slice(0, 300) }] }).catch(() => {});
+      for (let i = 0; i < content.length; i += chunkSize) {
+        const chunk = content.slice(i, i + chunkSize);
+        await s.append([
+          { role: 'user', content: chunk },
+        ]);
+      }
       appendedUrlRef.current = url;
       pageAppendedRef.current = true;
-      updateContextUsage();
-    } catch {}
+      updateContextUsage('append');
+    } catch (e) {
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['append: error', { msg: String(e) }] }).catch(() => {});
+    }
   }
+
+  async function recursiveSummarize(text: string, SummarizerAPI: any, outLang: Lang): Promise<string> {
+    const CHUNK_SIZE = 5000;
+    const summarizer = await SummarizerAPI.create({ type: 'key-points', format: 'plain-text', length: 'long', outputLanguage: outLang });
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += CHUNK_SIZE) {
+      chunks.push(text.slice(i, i + CHUNK_SIZE));
+    }
+    const summaries: string[] = [];
+    for (const chunk of chunks) {
+      summaries.push(await summarizer.summarize(chunk));
+    }
+    const combined = summaries.join('\n');
+    if (combined.length > CHUNK_SIZE) {
+      return recursiveSummarize(combined, SummarizerAPI, outLang);
+    }
+    return combined;
+  }
+
+  async function rebuildSession(overrideMessages?: StoredMessage[], acceptImages?: boolean) {
+    if (rebuildingRef.current) return;
+    rebuildingRef.current = true;
+    setOverflowMsg(true);
+    try {
+      const SummarizerAPI = (self as any).Summarizer;
+      if (!SummarizerAPI) return;
+
+      const avail = await SummarizerAPI.availability();
+      if (avail === 'unavailable' || avail === 'downloading') return;
+
+      const messages = overrideMessages ?? messagesRef.current;
+      if (messages.length < 2) return;
+
+      const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n\n');
+      const summarizer = await SummarizerAPI.create({ type: 'key-points', format: 'plain-text', length: 'short', outputLanguage: lang });
+      const summary = await summarizer.summarize(conversationText);
+
+      if (!summary || !sessionRef.current) return;
+
+      const pageContent = pageContextRef.current;
+      const lastTwo = messages.slice(-2).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+      const newPrompts: { role: 'user' | 'assistant'; content: string }[] = [
+        { role: 'user' as const, content: `[Previous conversation summary: ${summary}]` },
+        ...lastTwo,
+      ];
+      if (pageContent) {
+        newPrompts.push({ role: 'user' as const, content: pageContent });
+      }
+
+      const newSession = await createSession({
+        systemPrompt: SYSTEM_PROMPTS[lang],
+        language: lang,
+        history: newPrompts,
+        acceptImages,
+      });
+
+      sessionRef.current?.destroy();
+      sessionRef.current = newSession;
+      if (currentUrlRef.current) {
+        appendedUrlRef.current = currentUrlRef.current;
+        pageAppendedRef.current = true;
+      }
+      updateContextUsage('rebuild');
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['session: rebuilt', { summary: summary.slice(0, 200) }] }).catch(() => {});
+    } catch (e) {
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: error', { msg: String(e) }] }).catch(() => {});
+    } finally {
+      rebuildingRef.current = false;
+    }
+  }
+
+  function buildPrompt(userText: string): string {
+    return userText;
+  }
+
+  useEffect(() => {
+    browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['lifecycle: popup open'] }).catch(() => {});
+    return () => { void browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['lifecycle: popup close'] }); };
+  }, []);
 
   useEffect(() => {
     browser.storage.local.get([STORAGE_KEY, GRAB_KEY]).then((result) => {
       const stored = result[STORAGE_KEY] as StoredState | undefined;
       if (stored) {
         setMessages(stored.messages);
+        bootHistoryRef.current = stored.messages;
         if (stored.input) setInput(stored.input);
       }
 
@@ -161,13 +268,18 @@ export default function Chat({ lang, onLangChange }: Props) {
         }
         browser.storage.local.remove(GRAB_KEY);
       }
+      setStorageReady(true);
     });
   }, []);
 
   useEffect(() => {
+    if (!storageReady) return;
+    if (bootedRef.current && bootLangRef.current === lang) return;
+    bootLangRef.current = lang;
     let cancelled = false;
 
     async function boot() {
+      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['boot: start', { lang }] }).catch(() => {});
       setStatus('init');
       setError('');
       try {
@@ -185,19 +297,9 @@ export default function Chat({ lang, onLangChange }: Props) {
           return;
         }
 
-        const session = await createSession({
-          systemPrompt: SYSTEM_PROMPTS[lang],
-          language: lang,
-        });
-
-        if (cancelled) { session.destroy(); return; }
-        sessionRef.current = session;
-        sessionRef.current.addEventListener('contextoverflow', () => {
-          appendedUrlRef.current = null;
-        });
-        updateContextUsage();
-        setStatus('ready');
-
+        // Fetch current page context BEFORE creating session
+        let pageContent = '';
+        let pageUrl = '';
         const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
         if (tab?.id) {
           try {
@@ -206,12 +308,82 @@ export default function Chat({ lang, onLangChange }: Props) {
               pageContextRef.current = markdown;
               const m = markdown.match(/^URL: (.+)$/m);
               if (m) {
+                pageUrl = m[1];
                 currentUrlRef.current = m[1];
-                appendPageContext(m[1]);
+                pageContent = markdown;
               }
             }
           } catch {}
         }
+
+        // Try page in session, summarize if too large
+        const history = bootHistoryRef.current.map(m => ({ role: m.role, content: m.content }));
+        let pageIncluded = false;
+        let session;
+        const cache = await browser.storage.local.get(SUMMARY_CACHE_KEY).then(r => r[SUMMARY_CACHE_KEY] as { url: string; summary: string } | undefined);
+
+        if (pageContent) {
+          try {
+            session = await createSession({
+              systemPrompt: SYSTEM_PROMPTS[lang],
+              language: lang,
+              history: [...history, { role: 'user' as const, content: pageContent }],
+            });
+            pageIncluded = true;
+            appendedUrlRef.current = pageUrl!;
+            pageAppendedRef.current = true;
+          } catch (e: any) {
+            if (e?.message?.includes('too large') || e?.name === 'QuotaExceededError') {
+              let pageForSession: string | undefined;
+              if (cache?.url === pageUrl) {
+                pageForSession = cache.summary;
+              } else {
+                const SummarizerAPI = (self as any).Summarizer;
+                if (SummarizerAPI) {
+                  const avail = await SummarizerAPI.availability();
+                  if (avail !== 'unavailable' && avail !== 'downloading') {
+                    pageForSession = await recursiveSummarize(pageContent, SummarizerAPI, lang);
+                    browser.storage.local.set({ [SUMMARY_CACHE_KEY]: { url: pageUrl!, summary: pageForSession } }).catch(() => {});
+                  }
+                }
+              }
+              if (pageForSession) {
+                session = await createSession({
+                  systemPrompt: SYSTEM_PROMPTS[lang],
+                  language: lang,
+                  history: [...history, { role: 'user' as const, content: pageForSession }],
+                });
+                pageIncluded = true;
+                appendedUrlRef.current = pageUrl!;
+                pageAppendedRef.current = true;
+              }
+            }
+          }
+        }
+
+        if (!session) {
+          session = await createSession({
+            systemPrompt: SYSTEM_PROMPTS[lang],
+            language: lang,
+            history,
+          });
+        }
+
+        if (cancelled) { session.destroy(); return; }
+        sessionRef.current = session;
+        if (pageUrl && pageIncluded) {
+          appendedUrlRef.current = pageUrl;
+          pageAppendedRef.current = true;
+        }
+        bootedRef.current = true;
+        sessionRef.current.addEventListener('contextoverflow', () => {
+          appendedUrlRef.current = null;
+          overflowRef.current = true;
+          setOverflowMsg(true);
+          browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['event: contextoverflow', { usage: sessionRef.current?.contextUsage }] }).catch(() => {});
+        });
+        updateContextUsage('boot');
+        setStatus('ready');
       } catch (e: any) {
         setStatus('error');
         setError(e?.message ?? t('init_failed', lang));
@@ -220,7 +392,7 @@ export default function Chat({ lang, onLangChange }: Props) {
 
     boot();
     return () => { cancelled = true; sessionRef.current?.destroy(); };
-  }, [lang]);
+  }, [lang, storageReady]);
 
   useEffect(() => {
     const handler = (msg: any) => {
@@ -257,9 +429,11 @@ export default function Chat({ lang, onLangChange }: Props) {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
-  function buildPrompt(userText: string): string {
-    return userText;
-  }
+  useEffect(() => {
+    if (!overflowMsg) return;
+    const id = setTimeout(() => setOverflowMsg(false), 2500);
+    return () => clearTimeout(id);
+  }, [overflowMsg]);
 
   async function send() {
     const text = inputRef.current.trim();
@@ -268,23 +442,29 @@ export default function Chat({ lang, onLangChange }: Props) {
     const currentUrl = currentUrlRef.current;
     if ((!text && !grabbed) || loading) return;
 
+    if (overflowRef.current && !rebuildingRef.current) {
+      await rebuildSession(undefined, hasImageSession.current);
+    }
+
     abortRef.current = new AbortController();
     const signal = abortRef.current.signal;
 
     if (imageBlob && !hasImageSession.current) {
       try {
         const oldSession = sessionRef.current;
+        const history = messagesRef.current.map(m => ({ role: m.role, content: m.content }));
         const s = await createSession({
           systemPrompt: SYSTEM_PROMPTS[lang],
           language: lang,
           acceptImages: true,
+          history,
         });
         oldSession?.destroy();
         sessionRef.current = s;
         appendedUrlRef.current = null;
         pageAppendedRef.current = false;
         if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
-        updateContextUsage();
+        updateContextUsage('image-session');
         hasImageSession.current = true;
       } catch (e: any) {
         const msg = tpl('image_fail', lang, { error: e?.message || t('not_supported', lang) });
@@ -297,7 +477,26 @@ export default function Chat({ lang, onLangChange }: Props) {
       }
     }
 
-    const fullText = grabbed ? `${grabbed.text}\n\n${text}` : text;
+    let grabText = grabbed ? grabbed.text : undefined;
+    if (grabbed && grabbed.text.length > 800 && !summarizingRef.current) {
+      const SummarizerAPI = (self as any).Summarizer;
+      if (SummarizerAPI) {
+        try {
+          const avail = await SummarizerAPI.availability();
+          if (avail !== 'unavailable' && avail !== 'downloading') {
+            summarizingRef.current = true;
+            setSummarizing(true);
+            const sum = await SummarizerAPI.create({ type: 'key-points', format: 'plain-text', length: 'short', outputLanguage: lang });
+            grabText = await sum.summarize(grabbed.text);
+            setSummarizing(false);
+            summarizingRef.current = false;
+            browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['grab: summarized', { before: grabbed.text.length, after: grabText!.length }] }).catch(() => {});
+          }
+        } catch {}
+      }
+    }
+
+    const fullText = grabText ? `${grabText}\n\n${text}` : text;
 
     if (pageContextRef.current && currentUrlRef.current) {
       appendPageContext(currentUrlRef.current);
@@ -309,8 +508,6 @@ export default function Chat({ lang, onLangChange }: Props) {
       ? tpl('image_grabbed', lang, { text: text || t('image_desc', lang) })
       : text;
 
-    const grabText = grabbed ? grabbed.text : undefined;
-
     setInput('');
     setGrabbedInfo(null);
     pendingImageRef.current = null;
@@ -318,64 +515,77 @@ export default function Chat({ lang, onLangChange }: Props) {
     setMessages((prev) => [...prev, { role: 'user', content: displayText, ts: userTs, url: currentUrl, grabText, isImage: grabbed?.isImage }]);
     setLoading(true);
 
-    try {
-      let session = sessionRef.current;
-      if (!session) throw new Error(t('no_session', lang));
-
+    const maxAttempts = 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const aiTs = timestamp();
       setMessages((prev) => [...prev, { role: 'assistant', content: '', ts: aiTs, url: currentUrl }]);
 
-      if (imageBlob) {
-        const visionInput: any = [{ role: 'user' as const, content: [{ type: 'text' as const, value: text }, { type: 'image' as const, value: imageBlob }] }];
-        const response = await session.prompt(visionInput, { signal });
-        setMessages((prev) => {
-          const next = [...prev];
-          next[next.length - 1] = { ...next[next.length - 1], content: response, ts: aiTs };
+      try {
+        let session = sessionRef.current;
+        if (!session) throw new Error(t('no_session', lang));
+
+        if (imageBlob) {
+          const visionInput: any = [{ role: 'user' as const, content: [{ type: 'text' as const, value: text }, { type: 'image' as const, value: imageBlob }] }];
+          const response = await session.prompt(visionInput, { signal });
+          setMessages((prev) => {
+            const next = [...prev];
+            next[next.length - 1] = { ...next[next.length - 1], content: response, ts: aiTs };
             return next;
           });
-          updateContextUsage();
+          updateContextUsage('image-prompt');
         } else {
-        async function stream(s: AILanguageModel, prompt: string, sig: AbortSignal) {
-          let accumulated = '';
-          const stream = s.promptStreaming(prompt, { signal: sig });
-          for await (const chunk of stream) {
-            accumulated += chunk;
-            setMessages((prev) => {
-              const next = [...prev];
-              next[next.length - 1] = { ...next[next.length - 1], content: accumulated, ts: aiTs };
-              return next;
-            });
+          async function stream(s: AILanguageModel, prompt: string, sig: AbortSignal) {
+            let accumulated = '';
+            const stream = s.promptStreaming(prompt, { signal: sig });
+            for await (const chunk of stream) {
+              accumulated += chunk;
+              setMessages((prev) => {
+                const next = [...prev];
+                next[next.length - 1] = { ...next[next.length - 1], content: accumulated, ts: aiTs };
+                return next;
+              });
+            }
           }
-        }
-        updateContextUsage();
-        try {
-          await stream(session, textPrompt, signal);
-        } catch (e: any) {
-          const msg = e?.message ?? '';
-          if (msg.includes('output language')) {
-            session.destroy();
-            session = await createSession({ systemPrompt: SYSTEM_PROMPTS[lang], language: lang });
-            sessionRef.current = session;
-            appendedUrlRef.current = null;
-            pageAppendedRef.current = false;
-            if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
-            updateContextUsage();
-            setMessages((prev) => [...prev.slice(0, -1), { role: 'assistant', content: '', ts: timestamp(), url: currentUrl }]);
+          try {
             await stream(session, textPrompt, signal);
-          } else {
-            throw e;
+            updateContextUsage('stream-end');
+          } catch (e: any) {
+            const msg = e?.message ?? '';
+            if (msg.includes('output language')) {
+              session.destroy();
+              const retryHistory = messagesRef.current.map(m => ({ role: m.role, content: m.content }));
+              session = await createSession({ systemPrompt: SYSTEM_PROMPTS[lang], language: lang, history: retryHistory });
+              sessionRef.current = session;
+              appendedUrlRef.current = null;
+              pageAppendedRef.current = false;
+              if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
+              updateContextUsage('retry');
+              setMessages((prev) => [...prev.slice(0, -1), { role: 'assistant', content: '', ts: timestamp(), url: currentUrl }]);
+              await stream(session, textPrompt, signal);
+            } else {
+              throw e;
+            }
           }
         }
+        break;
+      } catch (e: any) {
+        if (e?.name === 'AbortError') return;
+        if (attempt === 0 && (e?.name === 'QuotaExceededError' || e?.message?.includes('too large'))) {
+          const msgs = messagesRef.current.slice(0, -1);
+          setMessages(msgs);
+          overflowRef.current = true;
+          await rebuildSession(msgs, hasImageSession.current);
+          continue;
+        }
+        const friendly = `Error: ${e?.message ?? 'Unknown'}`;
+        setMessages((prev) => [...prev, { role: 'assistant', content: friendly, ts: timestamp(), url: currentUrl }]);
+        break;
       }
-    } catch (e: any) {
-      if (e?.name === 'AbortError') return;
-      const friendly = `Error: ${e?.message ?? 'Unknown'}`;
-      setMessages((prev) => [...prev, { role: 'assistant', content: friendly, ts: timestamp(), url: currentUrl }]);
-    } finally {
-      abortRef.current = null;
-      updateContextUsage();
-      setLoading(false);
     }
+
+    abortRef.current = null;
+    updateContextUsage('finally');
+    setLoading(false);
   }
 
   function stop() {
@@ -497,16 +707,17 @@ export default function Chat({ lang, onLangChange }: Props) {
             onKeyDown={handleKeyDown}
           />
         </div>
-        <button className={`chat-send ${loading ? 'chat-send--stop' : ''}`} onClick={loading ? stop : send} disabled={!loading && (!input.trim() && !grabbedInfo)}>
-          [{loading ? '^C' : t('send', lang)}]
+        <button className={`chat-send ${loading ? 'chat-send--stop' : ''}`} onClick={loading ? stop : send} disabled={summarizing || loading || (!input.trim() && !grabbedInfo)}>
+          [{loading ? '^C' : summarizing ? '...' : t('send', lang)}]
         </button>
       </div>
       {grabbedInfo && (
         <div className="chat-grabbed">
-          <span className="chat-grabbed-text">[{t('text_pasted', lang)} ({grabbedInfo.text.length} {t('chars', lang)}){grabbedInfo.isImage ? ` · ${t('image', lang)}` : ''}]</span>
+          <span className={`chat-grabbed-text ${summarizing ? 'chat-grabbed-text--summarizing' : ''}`}>{summarizing ? `[${t('summarizing', lang)}]` : `[${t('text_pasted', lang)} (${grabbedInfo.text.length} ${t('chars', lang)})${grabbedInfo.isImage ? ` · ${t('image', lang)}` : ''}]`}</span>
           <button className="chat-grabbed-clear" onClick={() => { setGrabbedInfo(null); pendingImageRef.current = null; }}>[✕]</button>
         </div>
       )}
+      {overflowMsg && <div className="chat-overflow">context overflow — removing older context</div>}
       <div className="chat-model">
         <span>Gemini Nano <span className="chat-model-label">{t('model', lang).toLowerCase()}</span></span>
         <span className="chat-model-right">

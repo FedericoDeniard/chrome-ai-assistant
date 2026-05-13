@@ -13,6 +13,7 @@ export interface ChatOptions {
   topK?: number;
   language?: 'en' | 'es';
   acceptImages?: boolean;
+  history?: { role: 'user' | 'assistant'; content: string }[];
 }
 
 function buildSessionConfig(options: ChatOptions) {
@@ -46,6 +47,7 @@ export async function createSession(options: ChatOptions = {}): Promise<AILangua
     expectedOutputs,
     initialPrompts: [
       { role: 'system' as const, content: options.systemPrompt ?? 'You are a helpful and friendly assistant.' },
+      ...(options.history ?? []),
     ],
     temperature: options.temperature,
     topK: options.topK,

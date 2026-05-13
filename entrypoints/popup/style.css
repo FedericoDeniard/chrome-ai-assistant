@@ -602,6 +602,15 @@ body {
   font-weight: 600;
 }
 
+.chat-grabbed-text--summarizing {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
 .chat-grabbed-label {
   color: var(--fg-dim);
 }
@@ -657,9 +666,27 @@ body {
   color: var(--accent-red);
 }
 
+/* ── Context overflow toast ── */
+.chat-overflow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--accent-yellow);
+  text-align: center;
+  padding: 2px 16px;
+  background: var(--bg-surface);
+  animation: fade-out 2.5s ease-in forwards;
+}
+
+@keyframes fade-out {
+  0%, 60% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 /* ── Reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
   .chat-msg { animation: none; }
   .chat-msg-content-loading::after { animation: none; }
   .chat-status-loading::after { animation: none; }
+  .chat-overflow { animation: none; opacity: 1; }
+  .chat-grabbed-text--summarizing { animation: none; opacity: 0.6; }
 }

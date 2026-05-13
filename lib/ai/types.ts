@@ -6,6 +6,10 @@ export interface AILanguageModel {
   clone(): Promise<AILanguageModel>;
   readonly contextWindow: number;
   readonly contextUsage: number;
+  readonly inputQuota: number;
+  readonly inputUsage: number;
+  readonly tokensSoFar?: number;
+  readonly tokensLeft?: number;
   addEventListener(event: string, listener: Function): void;
   removeEventListener(event: string, listener: Function): void;
 }

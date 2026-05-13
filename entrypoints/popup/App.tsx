@@ -51,6 +51,7 @@ function App() {
 
   function newChat() {
     browser.storage.local.remove(STORAGE_KEY);
+    browser.storage.local.remove('page_summary_cache');
     setChatKey((k) => k + 1);
   }
 

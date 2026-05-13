@@ -10,5 +10,8 @@ export default defineBackground(() => {
     if (msg.type === 'GRAB_CAPTURED') {
       browser.action.openPopup().catch(() => {});
     }
+    if (msg.type === 'DEBUG_LOG') {
+      console.log('[ctx]', ...msg.args);
+    }
   });
 });

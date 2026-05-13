@@ -40,6 +40,7 @@ const strings: Record<string, Record<Lang, string>> = {
   text_pasted: { en: 'text pasted', es: 'texto pegado' },
   chars: { en: 'chars', es: 'caracteres' },
   image: { en: 'image', es: 'imagen' },
+  summarizing: { en: 'summarizing...', es: 'resumiendo...' },
 };
 
 export function t(key: string, lang: Lang): string {

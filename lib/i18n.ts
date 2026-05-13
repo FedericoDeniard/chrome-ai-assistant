@@ -25,6 +25,7 @@ const strings: Record<string, Record<Lang, string>> = {
     es: 'Prompt API no está disponible.\nAsegurate de tener Chrome 138+ y los requisitos de hardware.\nMirá chrome://on-device-internals',
   },
   downloading: { en: 'Downloading AI model... please wait', es: 'Descargando modelo de IA... esperá por favor' },
+  gesture_required: { en: 'AI model requires a user gesture to initialize.\nPlease close and reopen the popup to continue.', es: 'El modelo de IA requiere un gesto del usuario para inicializarse.\nPor favor cerrá y volvé a abrir el popup para continuar.' },
   init_failed: { en: 'Failed to initialize AI', es: 'Error al inicializar la IA' },
   no_session: { en: 'Session not initialized', es: 'Sesión no inicializada' },
   no_image: { en: 'Cannot paste images — text only', es: 'No se pueden pegar imágenes — solo texto' },

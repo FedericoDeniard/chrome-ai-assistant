@@ -42,23 +42,31 @@ export async function createSession(options: ChatOptions = {}): Promise<AILangua
 
   const { expectedInputs, expectedOutputs } = buildSessionConfig(options);
 
-  const session = await LanguageModel.create({
-    expectedInputs,
-    expectedOutputs,
-    initialPrompts: [
-      { role: 'system' as const, content: options.systemPrompt ?? 'You are a helpful and friendly assistant.' },
-      ...(options.history ?? []),
-    ],
-    temperature: options.temperature,
-    topK: options.topK,
-    monitor(m: EventTarget) {
-      m.addEventListener('downloadprogress', (e) => {
-        if (e instanceof ProgressEvent) {
-          console.log(`Download: ${(e.loaded * 100).toFixed(0)}%`);
-        }
-      });
-    },
-  });
+  let session;
+  try {
+    session = await LanguageModel.create({
+      expectedInputs,
+      expectedOutputs,
+      initialPrompts: [
+        { role: 'system' as const, content: options.systemPrompt ?? 'You are a helpful and friendly assistant.' },
+        ...(options.history ?? []),
+      ],
+      temperature: options.temperature,
+      topK: options.topK,
+      monitor(m: EventTarget) {
+        m.addEventListener('downloadprogress', (e) => {
+          if (e instanceof ProgressEvent) {
+            console.log(`Download: ${(e.loaded * 100).toFixed(0)}%`);
+          }
+        });
+      },
+    });
+  } catch (e: any) {
+    if (e?.message?.includes('Requires a user gesture')) {
+      throw new Error('GestureRequired');
+    }
+    throw e;
+  }
 
   return session as unknown as AILanguageModel;
 }

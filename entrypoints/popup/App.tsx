@@ -11,17 +11,24 @@ function App() {
   const [tabId, setTabId] = useState<number | null>(null);
   const [grabError, setGrabError] = useState(false);
   const [chatKey, setChatKey] = useState(0);
-  const [lang, setLang] = useState<Lang>('es');
+  // Start with null so Chat doesn't mount with a wrong default lang
+  // and trigger a double boot when the stored lang arrives.
+  const [lang, setLang] = useState<Lang | null>(null);
+
+  // Signal to background that popup is open, so it doesn't call
+  // openPopup() when GRAB_CAPTURED arrives (which would reboot the popup).
+  useEffect(() => {
+    browser.storage.session.set({ popup_open: true }).catch(() => {});
+    return () => {
+      browser.storage.session.set({ popup_open: false }).catch(() => {});
+    };
+  }, []);
 
   useEffect(() => {
     browser.storage.local.get([STORAGE_KEY, LANG_KEY]).then((result) => {
       const savedLang = result[LANG_KEY] as Lang | undefined;
-      if (savedLang) {
-        setLang(savedLang);
-      } else {
-        const stored = result[STORAGE_KEY] as { lang?: Lang } | undefined;
-        if (stored?.lang) setLang(stored.lang);
-      }
+      const stored = result[STORAGE_KEY] as { lang?: Lang } | undefined;
+      setLang(savedLang || stored?.lang || 'es');
     });
     browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
       if (!tab?.id) return;
@@ -53,6 +60,26 @@ function App() {
     browser.storage.local.remove(STORAGE_KEY);
     browser.storage.local.remove('page_summary_v2');
     setChatKey((k) => k + 1);
+  }
+
+  // Don't render Chat until lang is resolved from storage to avoid
+  // mounting with default 'es' and then re-mounting with the stored lang.
+  if (!lang) {
+    return (
+      <div className="app">
+        <header className="app-header">
+          <h1 className="app-title">ai-assistant</h1>
+        </header>
+        <div className="chat">
+          <div className="boot-loader">
+            <span className="boot-loader-prompt">&gt;</span>
+            <span className="boot-loader-text">
+              <span className="boot-loader-dot">.</span><span className="boot-loader-dot">.</span><span className="boot-loader-dot">.</span>
+            </span>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const grabTitle = grabError

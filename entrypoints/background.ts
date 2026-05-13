@@ -8,10 +8,14 @@ export default defineBackground(() => {
 
   browser.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'GRAB_CAPTURED') {
-      browser.action.openPopup().catch(() => {});
-    }
-    if (msg.type === 'DEBUG_LOG') {
-      console.log('[ctx]', ...msg.args);
+      // Only open popup if it's not already open — calling openPopup()
+      // while the popup is open causes Chrome to close and reopen it,
+      // remounting the entire React app and replaying the boot sequence.
+      browser.storage.session.get('popup_open').then(({ popup_open }) => {
+        if (!popup_open) {
+          browser.action.openPopup().catch(() => {});
+        }
+      });
     }
   });
 });

@@ -12,6 +12,10 @@ function renderMarkdown(text: string): string {
   return DOMPurify.sanitize(html);
 }
 
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function timestamp(): number {
   return Date.now();
 }
@@ -127,6 +131,7 @@ export default function Chat({ lang, onLangChange }: Props) {
   const [loading, setLoading] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [status, setStatus] = useState<'init' | 'ready' | 'error'>('init');
+  const [sessionLoading, setSessionLoading] = useState(false);
   const [error, setError] = useState('');
   const [contextUsage, setContextUsage] = useState<{ used: number; total: number } | null>(null);
   const [displayCtx, setDisplayCtx] = useState('');
@@ -162,7 +167,6 @@ export default function Chat({ lang, onLangChange }: Props) {
     if (s) {
       const used = s.inputUsage ?? s.contextUsage ?? 0;
       const total = s.inputQuota ?? s.contextWindow ?? 0;
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: [`${tag}: ${used}/${total}`, { inputUsage: s.inputUsage, inputQuota: s.inputQuota, contextUsage: s.contextUsage, contextWindow: s.contextWindow }] }).catch(() => {});
       setContextUsage({ used, total });
     }
   }
@@ -253,7 +257,6 @@ export default function Chat({ lang, onLangChange }: Props) {
       const content = pageContextRef.current;
       const chunkSize = 2048;
       const chunks = Math.ceil(content.length / chunkSize);
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['append: start', { totalLen: content.length, chunkSize, chunks, remaining: s.inputQuota - s.inputUsage, preview: content.slice(0, 300) }] }).catch(() => {});
       for (let i = 0; i < content.length; i += chunkSize) {
         const chunk = content.slice(i, i + chunkSize);
         await s.append([
@@ -264,7 +267,6 @@ export default function Chat({ lang, onLangChange }: Props) {
       pageAppendedRef.current = true;
       updateContextUsage('append');
     } catch (e) {
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['append: error', { msg: String(e) }] }).catch(() => {});
     }
   }
 
@@ -298,48 +300,36 @@ export default function Chat({ lang, onLangChange }: Props) {
     for (let level = 0; level < SUMMARY_LEVELS.length; level++) {
       try {
         const cfg = SUMMARY_LEVELS[level];
-        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['summarize: try level', { level, type: cfg.type, length: cfg.length }] }).catch(() => {});
         const result = await recursiveSummarize(text, SummarizerAPI, outLang, level, ctx);
-        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['summarize: ok', { level, len: result.length }] }).catch(() => {});
         return result;
       } catch (e) {
-        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['summarize: level failed', { level, msg: String(e) }] }).catch(() => {});
       }
     }
     return null;
   }
 
   async function rebuildSession(overrideMessages?: StoredMessage[], acceptImages?: boolean) {
-    browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: start', { rebuilding: rebuildingRef.current }] }).catch(() => {});
     if (rebuildingRef.current) return;
     rebuildingRef.current = true;
     setOverflowMsg(true);
     try {
       const SummarizerAPI = (self as any).Summarizer;
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: SummarizerAPI', { available: !!SummarizerAPI }] }).catch(() => {});
       if (!SummarizerAPI) {
-        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: skip - no Summarizer API'] }).catch(() => {});
         return;
       }
 
       const avail = await SummarizerAPI.availability();
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: availability', { avail }] }).catch(() => {});
       if (avail === 'unavailable' || avail === 'downloading') {
-        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: skip - not ready', { avail }] }).catch(() => {});
         return;
       }
 
       const messages = overrideMessages ?? messagesRef.current;
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: messages', { count: messages.length }] }).catch(() => {});
       if (messages.length < 2) {
-        browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: skip - too few messages'] }).catch(() => {});
         return;
       }
 
       const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n\n');
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: summarizing', { len: conversationText.length }] }).catch(() => {});
       const summary = await trySummarize(conversationText, SummarizerAPI, lang);
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: summary result', { ok: !!summary }] }).catch(() => {});
 
       // Try creating a rebuilt session with summary + last messages + page
       let newSession: AILanguageModel | null = null;
@@ -388,9 +378,7 @@ export default function Chat({ lang, onLangChange }: Props) {
             history: lastMsg,
             acceptImages,
           });
-          browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: minimal session created'] }).catch(() => {});
         } catch (e) {
-          browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: minimal also failed', { msg: String(e) }] }).catch(() => {});
           return;
         }
       }
@@ -404,9 +392,7 @@ export default function Chat({ lang, onLangChange }: Props) {
         pageAppendedRef.current = true;
       }
       updateContextUsage('rebuild');
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['session: rebuilt'] }).catch(() => {});
     } catch (e) {
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['rebuild: error', { msg: String(e) }] }).catch(() => {});
     } finally {
       rebuildingRef.current = false;
     }
@@ -415,11 +401,6 @@ export default function Chat({ lang, onLangChange }: Props) {
   function buildPrompt(userText: string): string {
     return userText;
   }
-
-  useEffect(() => {
-    browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['lifecycle: popup open'] }).catch(() => {});
-    return () => { void browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['lifecycle: popup close'] }); };
-  }, []);
 
   useEffect(() => {
     browser.storage.local.get([STORAGE_KEY, GRAB_KEY]).then((result) => {
@@ -443,27 +424,37 @@ export default function Chat({ lang, onLangChange }: Props) {
     });
   }, []);
 
+  // Run boot logic once: check AI availability, fetch page context, create session.
+  // Only depends on storageReady (not lang) to prevent double-boot when lang
+  // resolves from storage. Lang changes are handled by a separate effect below.
   useEffect(() => {
     if (!storageReady) return;
-    if (bootedRef.current && bootLangRef.current === lang) return;
-    bootLangRef.current = lang;
+    if (bootedRef.current) return;
+    bootedRef.current = true;
+    const bootLang = lang;
     let cancelled = false;
 
+    // If we have stored messages from a previous session, show the chat UI
+    // immediately while the session is being created in the background.
+    if (bootHistoryRef.current.length > 0) {
+      setStatus('ready');
+      setSessionLoading(true);
+    }
+
     async function boot() {
-      browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['boot: start', { lang }] }).catch(() => {});
       setError('');
       try {
-        const avail = await checkAvailability({ language: lang });
+        const avail = await checkAvailability({ language: bootLang });
 
         if (avail === 'unavailable') {
           setStatus('error');
-          setError(t('ai_unavailable', lang));
+          setError(t('ai_unavailable', bootLang));
           return;
         }
 
         if (avail === 'downloading') {
           setStatus('error');
-          setError(t('downloading', lang));
+          setError(t('downloading', bootLang));
           return;
         }
 
@@ -491,8 +482,8 @@ export default function Chat({ lang, onLangChange }: Props) {
         let session;
         try {
           session = await createSession({
-            systemPrompt: SYSTEM_PROMPTS[lang],
-            language: lang,
+            systemPrompt: SYSTEM_PROMPTS[bootLang],
+            language: bootLang,
             history: pageContent
               ? [...history, { role: 'user' as const, content: pageContent }]
               : history,
@@ -508,7 +499,7 @@ export default function Chat({ lang, onLangChange }: Props) {
               if (SummarizerAPI) {
                 const avail = await SummarizerAPI.availability();
                 if (avail !== 'unavailable' && avail !== 'downloading') {
-                  summarized = await trySummarize(pageContent, SummarizerAPI, lang, 'Be as precise and detailed as possible. Preserve all important information from the page.') ?? '';
+                  summarized = await trySummarize(pageContent, SummarizerAPI, bootLang, 'Be as precise and detailed as possible. Preserve all important information from the page.') ?? '';
                   if (summarized) {
                     browser.storage.local.set({ [PAGE_CACHE_KEY]: { url: pageUrl, text: summarized } }).catch(() => {});
                   }
@@ -518,16 +509,16 @@ export default function Chat({ lang, onLangChange }: Props) {
             if (summarized) {
               try {
                 session = await createSession({
-                  systemPrompt: SYSTEM_PROMPTS[lang],
-                  language: lang,
+                  systemPrompt: SYSTEM_PROMPTS[bootLang],
+                  language: bootLang,
                   history: [...history, { role: 'user' as const, content: summarized }],
                 });
               } catch {}
             }
             if (!session) {
               session = await createSession({
-                systemPrompt: SYSTEM_PROMPTS[lang],
-                language: lang,
+                systemPrompt: SYSTEM_PROMPTS[bootLang],
+                language: bootLang,
                 history,
               });
               pageContent = '';
@@ -539,29 +530,67 @@ export default function Chat({ lang, onLangChange }: Props) {
 
         if (cancelled) { session.destroy(); return; }
         sessionRef.current = session;
+        bootLangRef.current = bootLang;
         if (pageUrl && pageContent) {
           appendedUrlRef.current = pageUrl;
           pageAppendedRef.current = true;
         }
-        bootedRef.current = true;
         sessionRef.current.addEventListener('contextoverflow', () => {
           appendedUrlRef.current = null;
           overflowRef.current = true;
           setOverflowMsg(true);
-          browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['event: contextoverflow', { usage: sessionRef.current?.contextUsage }] }).catch(() => {});
         });
         updateContextUsage('boot');
         bootDoneRef.current = true;
         setStatus('ready');
+        setSessionLoading(false);
       } catch (e: any) {
+        setSessionLoading(false);
         setStatus('error');
-        setError((e as any)?.message ?? t('init_failed', lang));
+        const msg = (e as any)?.message ?? '';
+        setError(msg === 'GestureRequired' ? t('gesture_required', bootLang) : msg || t('init_failed', bootLang));
       }
     }
 
     boot();
     return () => { cancelled = true; sessionRef.current?.destroy(); };
-  }, [lang, storageReady]);
+  }, [storageReady]);
+
+  // Handle user-initiated lang changes: recreate session with new language.
+  useEffect(() => {
+    if (!bootedRef.current) return;
+    if (bootLangRef.current === lang) return;
+    // Skip if initial boot hasn't finished yet — the boot function
+    // already captured the correct lang. Changing lang during boot
+    // is not expected since App.tsx resolves lang before rendering.
+    if (!bootLangRef.current) return;
+    let cancelled = false;
+
+    async function changeLang() {
+      setSessionLoading(true);
+      try {
+        const oldSession = sessionRef.current;
+        if (oldSession) oldSession.destroy();
+        sessionRef.current = null;
+        const history = messagesRef.current.map(m => ({ role: m.role, content: m.content }));
+        const session = await createSession({
+          systemPrompt: SYSTEM_PROMPTS[lang],
+          language: lang,
+          history,
+        });
+        if (cancelled) { session.destroy(); return; }
+        sessionRef.current = session;
+        bootLangRef.current = lang;
+        if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
+        updateContextUsage('lang-change');
+      } catch (e: any) {
+      } finally {
+        if (!cancelled) setSessionLoading(false);
+      }
+    }
+    changeLang();
+    return () => { cancelled = true; };
+  }, [lang]);
 
   useEffect(() => {
     const handler = (msg: any) => {
@@ -700,7 +729,6 @@ export default function Chat({ lang, onLangChange }: Props) {
             grabText = await sum.summarize(grabbed.text, { context: text });
             setSummarizing(false);
             summarizingRef.current = false;
-            browser.runtime.sendMessage({ type: 'DEBUG_LOG', args: ['grab: summarized', { before: grabbed.text.length, after: grabText!.length }] }).catch(() => {});
           }
         } catch {}
       }
@@ -944,7 +972,8 @@ export default function Chat({ lang, onLangChange }: Props) {
                     className="chat-msg-content"
                     dangerouslySetInnerHTML={{
                       __html: isStreaming
-                        ? renderMarkdown(msg.content || '') + '<span class="cursor"></span>'
+                        ? // During streaming: skip heavy markdown parsing, just escape HTML for speed
+                          escapeHtml(msg.content || '') + '<span class="cursor"></span>'
                         : renderMarkdown(msg.content || ''),
                     }}
                   />
@@ -967,8 +996,8 @@ export default function Chat({ lang, onLangChange }: Props) {
             onKeyDown={handleKeyDown}
           />
         </div>
-        <button className={`chat-send ${loading ? 'chat-send--stop' : ''}`} onClick={loading ? stop : send} disabled={summarizing || loading || (!input.trim() && !grabbedInfo)}>
-          [{loading ? '^C' : summarizing ? '...' : t('send', lang)}]
+        <button className={`chat-send ${loading ? 'chat-send--stop' : ''}`} onClick={loading ? stop : send} disabled={summarizing || loading || sessionLoading || (!input.trim() && !grabbedInfo)}>
+          [{loading ? '^C' : summarizing || sessionLoading ? '...' : t('send', lang)}]
         </button>
       </div>
       {grabbedInfo && (

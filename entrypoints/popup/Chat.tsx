@@ -113,6 +113,7 @@ export default function Chat({ lang, onLangChange }: Props) {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<'init' | 'ready' | 'error'>('init');
   const [error, setError] = useState('');
+  const [contextUsage, setContextUsage] = useState<{ used: number; total: number } | null>(null);
   const sessionRef = useRef<AILanguageModel | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const pageContextRef = useRef<string | null>(null);
@@ -122,6 +123,26 @@ export default function Chat({ lang, onLangChange }: Props) {
   const inputRef = useRef(input);
   inputRef.current = input;
   const abortRef = useRef<AbortController | null>(null);
+  const appendedUrlRef = useRef<string | null>(null);
+  const pageAppendedRef = useRef(false);
+
+  function updateContextUsage() {
+    const s = sessionRef.current;
+    if (s) setContextUsage({ used: s.contextUsage, total: s.contextWindow });
+  }
+
+  async function appendPageContext(url: string) {
+    if (!sessionRef.current || !pageContextRef.current) return;
+    if (appendedUrlRef.current === url && pageAppendedRef.current) return;
+    try {
+      await sessionRef.current.append([
+        { role: 'user', content: pageContextRef.current },
+      ]);
+      appendedUrlRef.current = url;
+      pageAppendedRef.current = true;
+      updateContextUsage();
+    } catch {}
+  }
 
   useEffect(() => {
     browser.storage.local.get([STORAGE_KEY, GRAB_KEY]).then((result) => {
@@ -171,6 +192,10 @@ export default function Chat({ lang, onLangChange }: Props) {
 
         if (cancelled) { session.destroy(); return; }
         sessionRef.current = session;
+        sessionRef.current.addEventListener('contextoverflow', () => {
+          appendedUrlRef.current = null;
+        });
+        updateContextUsage();
         setStatus('ready');
 
         const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -180,7 +205,10 @@ export default function Chat({ lang, onLangChange }: Props) {
             if (markdown) {
               pageContextRef.current = markdown;
               const m = markdown.match(/^URL: (.+)$/m);
-              if (m) currentUrlRef.current = m[1];
+              if (m) {
+                currentUrlRef.current = m[1];
+                appendPageContext(m[1]);
+              }
             }
           } catch {}
         }
@@ -199,7 +227,10 @@ export default function Chat({ lang, onLangChange }: Props) {
       if (msg.type === 'PAGE_CONTEXT' && msg.markdown) {
         pageContextRef.current = msg.markdown;
         const m = msg.markdown.match(/^URL: (.+)$/m);
-        if (m) currentUrlRef.current = m[1];
+        if (m) {
+          currentUrlRef.current = m[1];
+          appendPageContext(m[1]);
+        }
       }
       if (msg.type === 'GRAB_CAPTURED') {
         browser.storage.local.get(GRAB_KEY).then((result) => {
@@ -227,9 +258,6 @@ export default function Chat({ lang, onLangChange }: Props) {
   }, [messages]);
 
   function buildPrompt(userText: string): string {
-    if (pageContextRef.current) {
-      return `${pageContextRef.current}\n\n---\n\n${userText}`;
-    }
     return userText;
   }
 
@@ -253,6 +281,10 @@ export default function Chat({ lang, onLangChange }: Props) {
         });
         oldSession?.destroy();
         sessionRef.current = s;
+        appendedUrlRef.current = null;
+        pageAppendedRef.current = false;
+        if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
+        updateContextUsage();
         hasImageSession.current = true;
       } catch (e: any) {
         const msg = tpl('image_fail', lang, { error: e?.message || t('not_supported', lang) });
@@ -266,6 +298,11 @@ export default function Chat({ lang, onLangChange }: Props) {
     }
 
     const fullText = grabbed ? `${grabbed.text}\n\n${text}` : text;
+
+    if (pageContextRef.current && currentUrlRef.current) {
+      appendPageContext(currentUrlRef.current);
+    }
+
     const textPrompt = buildPrompt(fullText);
 
     const displayText = imageBlob
@@ -294,9 +331,10 @@ export default function Chat({ lang, onLangChange }: Props) {
         setMessages((prev) => {
           const next = [...prev];
           next[next.length - 1] = { ...next[next.length - 1], content: response, ts: aiTs };
-          return next;
-        });
-      } else {
+            return next;
+          });
+          updateContextUsage();
+        } else {
         async function stream(s: AILanguageModel, prompt: string, sig: AbortSignal) {
           let accumulated = '';
           const stream = s.promptStreaming(prompt, { signal: sig });
@@ -309,6 +347,7 @@ export default function Chat({ lang, onLangChange }: Props) {
             });
           }
         }
+        updateContextUsage();
         try {
           await stream(session, textPrompt, signal);
         } catch (e: any) {
@@ -317,6 +356,10 @@ export default function Chat({ lang, onLangChange }: Props) {
             session.destroy();
             session = await createSession({ systemPrompt: SYSTEM_PROMPTS[lang], language: lang });
             sessionRef.current = session;
+            appendedUrlRef.current = null;
+            pageAppendedRef.current = false;
+            if (currentUrlRef.current) appendPageContext(currentUrlRef.current);
+            updateContextUsage();
             setMessages((prev) => [...prev.slice(0, -1), { role: 'assistant', content: '', ts: timestamp(), url: currentUrl }]);
             await stream(session, textPrompt, signal);
           } else {
@@ -330,6 +373,7 @@ export default function Chat({ lang, onLangChange }: Props) {
       setMessages((prev) => [...prev, { role: 'assistant', content: friendly, ts: timestamp(), url: currentUrl }]);
     } finally {
       abortRef.current = null;
+      updateContextUsage();
       setLoading(false);
     }
   }
@@ -465,7 +509,10 @@ export default function Chat({ lang, onLangChange }: Props) {
       )}
       <div className="chat-model">
         <span>Gemini Nano <span className="chat-model-label">{t('model', lang).toLowerCase()}</span></span>
-        <span className="app-title-version">v1.0.0</span>
+        <span className="chat-model-right">
+          {contextUsage && <span className="chat-model-ctx">{contextUsage.used}/{contextUsage.total}</span>}
+          <span className="app-title-version">v1.0.0</span>
+        </span>
       </div>
     </div>
   );

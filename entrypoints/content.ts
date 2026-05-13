@@ -1,12 +1,20 @@
 import { createGrabMode } from '@/lib/grab';
 import { extractPageContext, formatPageContext } from '@/lib/page-context';
+import TurndownService from 'turndown';
+
+const turndown = new TurndownService({
+  headingStyle: 'atx',
+  codeBlockStyle: 'fenced',
+  emDelimiter: '*',
+});
 
 export default defineContentScript({
   matches: ['*://*/*'],
   main() {
     const grab = createGrabMode({
       onGrab(html, selector, text, isImage, imageSrc) {
-        const data: any = { html, selector, text };
+        const md = turndown.turndown(html);
+        const data: any = { html, selector, text: `${md}\n\n/* selector: ${selector} */` };
 
         if (isImage && imageSrc) {
           data.isImage = true;

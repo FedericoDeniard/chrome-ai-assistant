@@ -538,6 +538,16 @@ body {
   margin-left: 4px;
 }
 
+.chat-model-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-model-ctx {
+  color: var(--fg-muted);
+}
+
 .chat-send {
   height: 34px;
   padding: 0 14px;
